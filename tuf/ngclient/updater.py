@@ -64,7 +64,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, cast
 from urllib import parse
 
 from tuf.api import exceptions
@@ -351,14 +351,58 @@ class Updater:
         with self._fetcher.download_file(
             full_url, targetinfo.length
         ) as target_file:
+            # The fetcher has fully received the body into a local temporary
+            # file; its response is already released at this point. Verify the
+            # complete content before anything visible is published.
             targetinfo.verify_length_and_hashes(target_file)
 
-            target_file.seek(0)
-            with open(filepath, "wb") as destination_file:
-                shutil.copyfileobj(target_file, destination_file)
+            # Publish atomically: stream the verified content into a
+            # temporary file in the destination directory and only replace
+            # the final path once that copy succeeded. A failure while
+            # writing therefore leaves an existing destination untouched and
+            # never exposes a partial file under the target path.
+            self._publish_file(filepath, target_file)
 
         logger.debug("Downloaded target %s", targetinfo.path)
         return filepath
+
+    @staticmethod
+    def _publish_file(filepath: str, source: IO[bytes]) -> None:
+        """Atomically copy ``source`` to ``filepath``.
+
+        A temporary file is created next to the destination (so that
+        ``os.replace()`` stays a same-filesystem rename) and removed on any
+        failure. The existing destination, if any, is not touched until the
+        complete new content is safely written.
+        """
+        destination_dir = str(Path(filepath).parent)
+        temp_name: str | None = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination_dir, delete=False
+            ) as dest_file:
+                temp_name = dest_file.name
+                source.seek(0)
+                shutil.copyfileobj(source, dest_file)
+
+            # Preserve the permission bits of an existing destination. A new
+            # file gets the same mode ``open(filepath, "wb")`` would have
+            # produced (0600 from NamedTemporaryFile is too restrictive).
+            try:
+                mode = os.stat(filepath).st_mode & 0o777
+            except FileNotFoundError:
+                current_umask = os.umask(0)
+                os.umask(current_umask)
+                mode = 0o666 & ~current_umask
+            os.chmod(temp_name, mode)
+
+            os.replace(temp_name, filepath)
+            temp_name = None
+        finally:
+            if temp_name is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(temp_name)
 
     def _download_metadata(
         self, rolename: str, length: int, version: int | None = None

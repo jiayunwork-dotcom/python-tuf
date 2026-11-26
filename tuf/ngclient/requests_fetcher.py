@@ -14,6 +14,7 @@ Urllib3Fetcher:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 from urllib import parse
@@ -30,6 +31,65 @@ if TYPE_CHECKING:
 
 # Globals
 logger = logging.getLogger(__name__)
+
+
+class _ResponseIterator:
+    """Iterator that owns a ``requests.Response``.
+
+    The response is acquired eagerly in ``_fetch()`` but the body is streamed
+    lazily. A plain generator would leak the response if the caller closes
+    before requesting the first chunk (the generator's ``finally`` never runs
+    in that case), so ownership is explicit here.
+    """
+
+    def __init__(self, response: requests.Response, chunk_size: int) -> None:
+        self._response = response
+        self._chunks = self._iter_chunks(response, chunk_size)
+        self._completed = False
+        self._closed = False
+
+    def __iter__(self) -> _ResponseIterator:
+        return self
+
+    def __next__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self._completed = True
+            self._release()
+            raise
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _iter_chunks(
+        response: requests.Response, chunk_size: int
+    ) -> Iterator[bytes]:
+        try:
+            yield from response.iter_content(chunk_size)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            raise exceptions.SlowRetrievalError from e
+
+    def _release(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # requests releases the connection when the response is closed. On an
+        # early close the remaining body is deliberately not drained: a huge
+        # or never-ending response must not monopolize the download.
+        self._response.close()
+
+    def close(self) -> None:
+        """Stop streaming and release the response, started or not."""
+        if self._closed:
+            return
+        with contextlib.suppress(Exception):
+            self._chunks.close()
+        self._release()
 
 
 # Classes
@@ -107,25 +167,7 @@ class RequestsFetcher(FetcherInterface):
             status = e.response.status_code
             raise exceptions.DownloadHTTPError(str(e), status) from e
 
-        return self._chunks(response)
-
-    def _chunks(self, response: requests.Response) -> Iterator[bytes]:
-        """A generator function to be returned by fetch.
-
-        This way the caller of fetch can differentiate between connection
-        and actual data download.
-        """
-
-        try:
-            yield from response.iter_content(self.chunk_size)
-        except (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as e:
-            raise exceptions.SlowRetrievalError from e
-
-        finally:
-            response.close()
+        return _ResponseIterator(response, self.chunk_size)
 
     def _get_session(self, url: str) -> requests.Session:
         """Return a different customized requests.Session per schema+hostname

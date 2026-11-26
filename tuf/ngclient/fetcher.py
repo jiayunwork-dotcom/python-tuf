@@ -3,6 +3,8 @@
 
 """Provides an interface for network IO abstraction."""
 
+from __future__ import annotations
+
 # Imports
 import abc
 import logging
@@ -14,6 +16,62 @@ from typing import IO
 from tuf.api import exceptions
 
 logger = logging.getLogger(__name__)
+
+
+class _DownloadStream(Iterator[bytes]):
+    """Iterator adapter returned by :meth:`FetcherInterface.fetch`.
+
+    It makes two guarantees that plain iterators do not provide:
+
+    * ``close()`` is idempotent and works even before the first chunk has been
+      requested. This matters for fetchers such as ``Urllib3Fetcher`` that
+      acquire their network resource eagerly in ``_fetch()``: a generator that
+      has never been started does not run its ``finally`` block on ``close()``.
+    * Any exception raised while streaming is converted to a ``DownloadError``,
+      matching what ``fetch()`` already promises for errors raised while
+      calling ``_fetch()``.
+
+    The wrapper never closes the underlying iterator on normal exhaustion:
+    that would turn a clean end into an early close for fetchers that use the
+    distinction to decide whether a connection may be reused.
+    """
+
+    def __init__(self, iterator: Iterator[bytes], url: str) -> None:
+        self._iterator = iter(iterator)
+        self._url = url
+        self._closed = False
+
+    def __iter__(self) -> _DownloadStream:
+        return self
+
+    def __next__(self) -> bytes:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            raise
+        except exceptions.DownloadError:
+            self.close()
+            raise
+        except Exception as e:
+            self.close()
+            raise exceptions.DownloadError(
+                f"Failed to download {self._url}"
+            ) from e
+
+    def close(self) -> None:
+        """Release the underlying iterator, even if it was never started."""
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._iterator, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception as e:  # noqa: BLE001
+                # Never let cleanup mask the streaming error that caused it.
+                logger.debug("Error while closing download stream: %s", e)
 
 
 # Classes
@@ -50,7 +108,7 @@ class FetcherInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError  # pragma: no cover
 
-    def fetch(self, url: str) -> Iterator[bytes]:
+    def fetch(self, url: str) -> _DownloadStream:
         """Fetch the contents of HTTP/HTTPS ``url`` from a remote server.
 
         Args:
@@ -61,16 +119,22 @@ class FetcherInterface(metaclass=abc.ABCMeta):
             DownloadHTTPError: An HTTP error code was received.
 
         Returns:
-            Bytes iterator
+            Bytes iterator. The returned iterator must be treated as a
+            resource: callers that stop reading before exhaustion (or before
+            reading at all) must call ``close()`` on it so that the fetcher
+            can release its response. Iterating to the end releases the
+            resource as well.
         """
         # Ensure that fetch() only raises DownloadErrors, regardless of the
         # fetcher implementation
         try:
-            return self._fetch(url)
-        except exceptions.DownloadError as e:
-            raise e
+            iterator = self._fetch(url)
+        except exceptions.DownloadError:
+            raise
         except Exception as e:
             raise exceptions.DownloadError(f"Failed to download {url}") from e
+
+        return _DownloadStream(iterator, url)
 
     @contextmanager
     def download_file(self, url: str, max_length: int) -> Iterator[IO]:
@@ -99,15 +163,22 @@ class FetcherInterface(metaclass=abc.ABCMeta):
 
         with tempfile.TemporaryFile() as temp_file:
             chunks = self.fetch(url)
-            for chunk in chunks:
-                number_of_bytes_received += len(chunk)
-                if number_of_bytes_received > max_length:
-                    raise exceptions.DownloadLengthMismatchError(
-                        f"Downloaded {number_of_bytes_received} bytes exceeding"
-                        f" the maximum allowed length of {max_length}"
-                    )
+            try:
+                for chunk in chunks:
+                    number_of_bytes_received += len(chunk)
+                    if number_of_bytes_received > max_length:
+                        raise exceptions.DownloadLengthMismatchError(
+                            f"Downloaded {number_of_bytes_received} bytes"
+                            f" exceeding the maximum allowed length of"
+                            f" {max_length}"
+                        )
 
-                temp_file.write(chunk)
+                    temp_file.write(chunk)
+            finally:
+                # Release the response whether streaming failed, the length
+                # limit was hit, or the caller stopped consuming. A stream
+                # that has simply finished needs no explicit close.
+                chunks.close()
 
             logger.debug(
                 "Downloaded %d out of %d bytes",

@@ -3,6 +3,8 @@
 
 """Unit test for Urllib3Fetcher."""
 
+from __future__ import annotations
+
 import io
 import logging
 import math
@@ -10,7 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from unittest.mock import Mock, patch
 
 import urllib3
@@ -18,6 +20,10 @@ import urllib3
 from tests import utils
 from tuf.api import exceptions
 from tuf.ngclient import Urllib3Fetcher
+from tuf.ngclient.fetcher import FetcherInterface
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +240,187 @@ class TestFetcher(unittest.TestCase):
             self.fetcher.download_file(self.url, self.file_length - 4),
         ):
             pass  # we never get here as download_file() raises
+
+    # ------------------------------------------------------------------
+    # Response ownership: fetch() returns a stream the caller must close
+    # ------------------------------------------------------------------
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_close_before_first_chunk_closes_response(
+        self, mock_request: Mock
+    ) -> None:
+        # The response is acquired eagerly in _fetch(), but the body generator
+        # has not been started. Closing must still close the response instead
+        # of relying on garbage collection.
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.return_value = iter([b"a", b"b"])
+        mock_request.return_value = mock_response
+
+        chunks = self.fetcher.fetch(self.url)
+        chunks.close()
+
+        mock_response.close.assert_called_once()
+        mock_response.release_conn.assert_not_called()
+        # An explicitly closed stream yields nothing more.
+        self.assertEqual(list(chunks), [])
+        mock_response.close.assert_called_once()
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_close_midway_closes_response(self, mock_request: Mock) -> None:
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.return_value = iter([b"a", b"b", b"c"])
+        mock_request.return_value = mock_response
+
+        chunks = self.fetcher.fetch(self.url)
+        self.assertEqual(next(chunks), b"a")
+        chunks.close()
+
+        mock_response.close.assert_called_once()
+        mock_response.release_conn.assert_not_called()
+        with self.assertRaises(StopIteration):
+            next(chunks)
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_full_read_releases_connection(self, mock_request: Mock) -> None:
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.return_value = iter([b"a", b"b"])
+        mock_request.return_value = mock_response
+
+        self.assertEqual(list(self.fetcher.fetch(self.url)), [b"a", b"b"])
+
+        # A clean end returns the connection to the pool for reuse.
+        mock_response.release_conn.assert_called_once()
+        mock_response.close.assert_not_called()
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_midstream_error_closes_response(self, mock_request: Mock) -> None:
+        def failing_stream(_amt: int) -> Iterator[bytes]:
+            yield b"a"
+            raise urllib3.exceptions.ProtocolError("connection broken")
+
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.side_effect = failing_stream
+        mock_request.return_value = mock_response
+
+        chunks = self.fetcher.fetch(self.url)
+        self.assertEqual(next(chunks), b"a")
+        with self.assertRaises(exceptions.DownloadError):
+            next(chunks)
+
+        mock_response.close.assert_called_once()
+        mock_response.release_conn.assert_not_called()
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_fetcher_reusable_after_early_close(
+        self, mock_request: Mock
+    ) -> None:
+        first = Mock()
+        first.status = 200
+        first.stream.return_value = iter([b"a", b"b"])
+        second = Mock()
+        second.status = 200
+        second.stream.return_value = iter([b"c"])
+        mock_request.side_effect = [first, second]
+
+        chunks = self.fetcher.fetch(self.url)
+        chunks.close()
+
+        # Same fetcher instance completes another download afterwards.
+        self.assertEqual(list(self.fetcher.fetch(self.url)), [b"c"])
+        second.release_conn.assert_called_once()
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_non_timeout_retry_error_propagates(
+        self, mock_request: Mock
+    ) -> None:
+        # A non-timeout MaxRetryError must not be silently swallowed (which
+        # would look like a complete, empty download).
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.side_effect = urllib3.exceptions.MaxRetryError(
+            urllib3.connectionpool.ConnectionPool("localhost"),
+            "",
+            urllib3.exceptions.SSLError("certificate verify failed"),
+        )
+        mock_request.return_value = mock_response
+
+        chunks = self.fetcher.fetch(self.url)
+        with self.assertRaises(exceptions.DownloadError):
+            next(chunks)
+
+        mock_response.close.assert_called_once()
+
+    @patch.object(urllib3.PoolManager, "request")
+    def test_stream_close_after_normal_exhaustion_is_noop(
+        self, mock_request: Mock
+    ) -> None:
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.stream.return_value = iter([b"a"])
+        mock_request.return_value = mock_response
+
+        chunks = self.fetcher.fetch(self.url)
+        self.assertEqual(list(chunks), [b"a"])
+        # Exhaustion already released the connection; closing afterwards must
+        # not close or release it a second time.
+        chunks.close()
+        mock_response.release_conn.assert_called_once()
+        mock_response.close.assert_not_called()
+
+
+class _BareFetcher(FetcherInterface):
+    """Fetcher returning iterators with and without a ``close`` method."""
+
+    def __init__(self, iterator: Iterator[bytes]) -> None:
+        self._iterator = iterator
+
+    def _fetch(self, _url: str) -> Iterator[bytes]:
+        return self._iterator
+
+
+class TestDownloadStreamAdapter(unittest.TestCase):
+    """Behaviour of the ``fetch()`` stream adapter itself."""
+
+    def test_close_without_underlying_close_is_noop(self) -> None:
+        # A plain list iterator has no close(): closing must simply stop it.
+        fetcher = _BareFetcher(iter([b"a"]))
+        chunks = fetcher.fetch("http://example.com/")
+        chunks.close()
+        self.assertEqual(list(chunks), [])
+
+    def test_close_swallows_underlying_close_error(self) -> None:
+        class BadIterator:
+            def __iter__(self) -> BadIterator:
+                return self
+
+            def __next__(self) -> bytes:
+                return b"a"
+
+            def close(self) -> None:
+                raise RuntimeError("cleanup failed")
+
+        chunks = _BareFetcher(BadIterator()).fetch("http://example.com/")
+        # A failing close must not raise to the caller.
+        chunks.close()
+
+    def test_wraps_streaming_error_as_download_error(self) -> None:
+        class ExplodingIterator:
+            def __iter__(self) -> ExplodingIterator:
+                return self
+
+            def __next__(self) -> bytes:
+                raise RuntimeError("boom")
+
+            def close(self) -> None:
+                pass
+
+        chunks = _BareFetcher(ExplodingIterator()).fetch("http://example.com/")
+        with self.assertRaises(exceptions.DownloadError):
+            next(chunks)
 
 
 # Run unit test.

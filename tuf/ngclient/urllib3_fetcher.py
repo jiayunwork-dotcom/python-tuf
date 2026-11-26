@@ -7,6 +7,7 @@ library.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,89 @@ if TYPE_CHECKING:
 
 # Globals
 logger = logging.getLogger(__name__)
+
+
+class _ResponseIterator:
+    """Iterator that owns an urllib3 response.
+
+    ``_fetch()`` acquires the response eagerly (so that connection and HTTP
+    errors surface from ``fetch()`` instead of from the first ``next()``), but
+    the body is only streamed lazily. A plain generator cannot express that:
+    closing a generator that has never been started does not run its
+    ``finally`` block, so the response would stay open until garbage
+    collection. This class closes the response explicitly, whether or not
+    streaming has started.
+    """
+
+    def __init__(
+        self,
+        response: urllib3.response.BaseHTTPResponse,
+        chunk_size: int,
+    ) -> None:
+        self._response = response
+        self._chunks = self._iter_chunks(response, chunk_size)
+        self._completed = False
+        self._closed = False
+
+    def __iter__(self) -> _ResponseIterator:
+        return self
+
+    def __next__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self._completed = True
+            # The stream was read to the end: the connection is clean and can
+            # be returned to the pool for reuse.
+            self._release()
+            raise
+        except Exception:
+            # A read/translation error means the connection is no longer
+            # usable for this download: close it before propagating.
+            self.close()
+            raise
+
+    @staticmethod
+    def _iter_chunks(
+        response: urllib3.response.BaseHTTPResponse, chunk_size: int
+    ) -> Iterator[bytes]:
+        """Stream the response body, translating urllib3 errors."""
+        try:
+            yield from response.stream(chunk_size)
+        except urllib3.exceptions.TimeoutError as e:
+            # Raised directly when the gap timeout expires mid-stream:
+            # ReadTimeoutError is a TimeoutError but not a MaxRetryError.
+            raise exceptions.SlowRetrievalError from e
+        except urllib3.exceptions.MaxRetryError as e:
+            if isinstance(e.reason, urllib3.exceptions.TimeoutError):
+                raise exceptions.SlowRetrievalError from e
+            # Any other reason: propagate rather than ending the stream
+            # silently, which would look like a complete download.
+            raise
+
+    def _release(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._completed:
+            self._response.release_conn()
+        else:
+            # Early close (length limit exceeded, caller abort, or read
+            # error): do not drain the remaining body just to reuse the
+            # connection. Closing drops the connection instead, so a huge or
+            # never-ending response cannot keep us busy.
+            self._response.close()
+
+    def close(self) -> None:
+        """Stop streaming and release the response, started or not."""
+        if self._closed:
+            return
+        # Closing the body generator first drops an in-flight connection
+        # through urllib3's own error handling; then make sure the response
+        # itself is closed as well.
+        with contextlib.suppress(Exception):
+            self._chunks.close()
+        self._release()
 
 
 # Classes
@@ -92,29 +176,4 @@ class Urllib3Fetcher(FetcherInterface):
                 response.status,
             )
 
-        return self._chunks(response)
-
-    def _chunks(
-        self, response: urllib3.response.BaseHTTPResponse
-    ) -> Iterator[bytes]:
-        """A generator function to be returned by fetch.
-
-        This way the caller of fetch can differentiate between connection
-        and actual data download.
-        """
-
-        try:
-            yield from response.stream(self.chunk_size)
-        except urllib3.exceptions.TimeoutError as e:
-            # Raised directly when the gap timeout expires mid-stream:
-            # ReadTimeoutError is a TimeoutError but not a MaxRetryError.
-            raise exceptions.SlowRetrievalError from e
-        except urllib3.exceptions.MaxRetryError as e:
-            if isinstance(e.reason, urllib3.exceptions.TimeoutError):
-                raise exceptions.SlowRetrievalError from e
-            # Any other reason: propagate rather than ending the stream
-            # silently, which would look like a complete download.
-            raise
-
-        finally:
-            response.release_conn()
+        return _ResponseIterator(response, self.chunk_size)

@@ -15,6 +15,7 @@ This log lists the architectural decisions for tuf.
 - [ADR-0008](0008-accept-unrecognised-fields.md) - Accept metadata that includes unrecognized fields
 - [ADR-0009](0009-what-is-a-reference-implementation.md) - Primary purpose of the reference implementation
 - [ADR-0010](0010-repository-library-design.md) - Repository library design built on top of Metadata API
+- [ADR-0011](0011-target-download-failure-boundaries.md) - Failure boundaries for target downloads
 
 <!-- adrlogstop -->
 

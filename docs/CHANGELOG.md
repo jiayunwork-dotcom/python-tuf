@@ -7,6 +7,15 @@
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.
   Require at least 3.11
 
+### Fixed
+
+* ngclient: A failed target download no longer truncates or partially
+  overwrites an existing target file: content is verified first and published
+  atomically with a rename.
+* ngclient: `fetch()` now returns a stream that can be closed even before its
+  first chunk, and a rejected (oversized) or aborted download closes its
+  response instead of leaving it open or draining it.
+
 ## v7.0.1
 
 ### Fixed
