@@ -378,6 +378,23 @@ class TrustedMetadataSet(abc.Mapping):
                 f"got {self.snapshot.version}"
             )
 
+    def is_final_snapshot(self) -> bool:
+        """Return whether a snapshot is loaded and passes final checks.
+
+        Unlike :meth:`_check_final_snapshot` this does not raise: it lets the
+        Updater decide whether locally loaded snapshot state is sufficient or
+        a remote snapshot must be downloaded. Intermediate snapshots (expired
+        or with a version that does not match timestamp) make this return
+        ``False`` while still remaining in the set for rollback protection.
+        """
+        if Snapshot.type not in self._trusted_set:
+            return False
+        try:
+            self._check_final_snapshot()
+        except exceptions.RepositoryError:
+            return False
+        return True
+
     def update_targets(self, data: bytes) -> Targets:
         """Verify and load ``data`` as new top-level targets metadata.
 

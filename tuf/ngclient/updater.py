@@ -15,11 +15,15 @@ High-level description of ``Updater`` functionality:
     metadata. Updater should always be initialized with the ``bootstrap``
     argument: pass ``bootstrap=None`` only to explicitly opt into using the
     cached root.json as the trust anchor.
-  * ``refresh()`` can optionally be called to update and load all top-level
-    metadata as described in the specification, using both locally cached
-    metadata and metadata downloaded from the remote repository. If refresh is
-    not done explicitly, it will happen automatically during the first target
-    info lookup.
+  * ``refresh()`` downloads, verifies, and loads metadata for the top-level
+    roles as described in the specification. It may be called any number of
+    times on the same ``Updater`` instance, including retrying after a failed
+    refresh. Each successful refresh atomically replaces the previously
+    available metadata view: until a refresh succeeds, ``get_targetinfo()``
+    keeps serving the most recent complete successful view. Version lower
+    bounds of authenticated top-level metadata are persisted immediately and
+    continue to constrain later refreshes, including after an ``Updater`` is
+    rebuilt over the same metadata directory.
   * ``Updater`` can be used to download targets. For each target:
 
       * ``Updater.get_targetinfo()`` is first used to find information about a
@@ -141,7 +145,16 @@ class Updater:
             # if no root was provided, use the cached non-versioned root.json
             bootstrap = self._load_local_metadata(Root.type)
 
-        # Load the initial root, make sure it's cached
+        # The trust anchor is retained so that every refresh can build a new
+        # candidate TrustedMetadataSet from exactly the same starting point.
+        # This makes an in-process retry equivalent to rebuilding the Updater
+        # over the same metadata directory.
+        self._bootstrap = bootstrap
+
+        # ``_trusted_set`` is the last *complete and successful* metadata view.
+        # It is the only view used by target lookup and is replaced atomically
+        # when a refresh finishes successfully: a failed refresh discards its
+        # candidate and never mutates this view.
         self._trusted_set = TrustedMetadataSet(
             bootstrap, self.config.envelope_type
         )
@@ -160,7 +173,29 @@ class Updater:
         specified order (root -> timestamp -> snapshot -> targets) implementing
         all the checks required in the TUF client workflow.
 
-        A ``refresh()`` can be done only once during the lifetime of an Updater.
+        ``refresh()`` may be called repeatedly on the same ``Updater``
+        instance. Every call builds a fresh candidate
+        ``TrustedMetadataSet`` from the bootstrap root and the persisted
+        metadata (including rollback anchors written by earlier, possibly
+        failed, rounds), so a failed round cannot leave partially updated
+        metadata in the view used by ``get_targetinfo()`` and a later call can
+        simply retry.
+
+        The most recent complete successful view stays available for target
+        lookups until a new refresh completes successfully. Authenticated
+        root/timestamp/snapshot version advances made by a round are persisted
+        immediately -- even when a later check in that same round fails -- so
+        they keep protecting against rollback attacks on both in-process
+        retries and freshly constructed instances using the same metadata
+        directory. Metadata that fails signature or trust-chain verification is
+        never persisted as an anchor and therefore cannot raise the rollback
+        version lower bound.
+
+        A successful refresh atomically replaces the serving view, including
+        its delegated metadata cache. Delegated roles visited under an older
+        view are consequently read from disk and verified again against the
+        new snapshot/delegations before they are reused.
+
         If ``refresh()`` has not been explicitly called before the first
         ``get_targetinfo()`` call, it will be done implicitly at that time.
 
@@ -177,10 +212,23 @@ class Updater:
             DownloadError: Download of a metadata file failed in some way
         """
 
-        self._load_root()
-        self._load_timestamp()
-        self._load_snapshot()
-        self._load_targets(Targets.type, Root.type)
+        # Build the entire new top-level view in a private candidate. The
+        # serving view (``self._trusted_set``) is untouched until every
+        # top-level role has been verified, so any exception below leaves the
+        # last complete view fully usable.
+        candidate = TrustedMetadataSet(
+            self._bootstrap, self.config.envelope_type
+        )
+
+        self._load_root(candidate)
+        self._load_timestamp(candidate)
+        self._load_snapshot(candidate)
+        self._load_targets(Targets.type, Root.type, candidate)
+
+        # Complete top-level update: publish the new view atomically. This also
+        # drops the per-view delegated metadata cache, forcing re-verification
+        # under the new snapshot/delegations on the next target lookup.
+        self._trusted_set = candidate
 
     def _generate_target_file_path(self, targetinfo: TargetFile) -> str:
         if self.target_dir is None:
@@ -339,6 +387,57 @@ class Updater:
         filename = os.path.join(self._dir, f"{encoded_name}.json")
         self._persist_file(filename, data)
 
+    # Directory for rollback anchors: authenticated top-level metadata that a
+    # round accepted into a candidate as an *intermediate* rollback boundary
+    # but that did not become a final view (e.g. an expired timestamp or a
+    # snapshot whose version does not match timestamp yet). The regular
+    # unversioned cache files only contain final metadata; these anchors make
+    # sure the higher version lower bounds survive both a retry on this
+    # instance and a rebuild over the same metadata directory.
+    #
+    # A subdirectory (instead of another top-level "<role>.json" file) keeps
+    # the regular metadata cache layout and its file-list expectations intact.
+    _ANCHOR_DIRNAME = "rollback_anchors"
+
+    def _anchor_file(self, rolename: str) -> str:
+        encoded_name = parse.quote(rolename, "")
+        return os.path.join(
+            self._dir, self._ANCHOR_DIRNAME, f"{encoded_name}.json"
+        )
+
+    def _load_local_anchor(self, rolename: str) -> bytes | None:
+        """Read a persisted rollback anchor for ``rolename``.
+
+        Returns ``None`` when no anchor exists. Existence is checked with
+        ``os.path.isfile`` (not by attempting ``open``) so a metadata cache
+        without anchors produces no extra ``open()`` calls.
+        """
+        anchor = self._anchor_file(rolename)
+        if not os.path.isfile(anchor):
+            return None
+        with open(anchor, "rb") as f:
+            return f.read()
+
+    def _persist_anchor(self, rolename: str, data: bytes) -> None:
+        """Persist an authenticated intermediate rollback anchor."""
+        anchor_dir = os.path.join(self._dir, self._ANCHOR_DIRNAME)
+        os.makedirs(anchor_dir, exist_ok=True)
+        self._persist_file(self._anchor_file(rolename), data)
+
+    def _remove_anchor(self, rolename: str) -> None:
+        """Drop a rollback anchor superseded by final metadata.
+
+        Cleanup is best-effort: a leftover anchor cannot weaken security (it
+        is re-verified on replay and can only establish an older-or-equal
+        lower bound than the freshly persisted final metadata).
+        """
+        try:
+            os.remove(self._anchor_file(rolename))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.debug("Could not remove %s rollback anchor: %s", rolename, e)
+
     def _persist_root(self, version: int, data: bytes) -> None:
         """Write root metadata to disk atomically to avoid data loss.
 
@@ -368,10 +467,18 @@ class Updater:
                     os.remove(temp_file_name)
             raise e
 
-    def _update_root_symlink(self) -> None:
-        """Symlink root.json to current trusted root version in root_history/"""
+    def _update_root_symlink(self, version: int | None = None) -> None:
+        """Symlink root.json to current trusted root version in root_history/
+
+        When ``version`` is not given, the version of the serving view is
+        used. During a refresh the candidate's newest version is passed so the
+        symlink advances even if the refresh later fails: every root in
+        root_history has already been authenticated and the advanced symlink
+        is also the correct trust anchor for ``bootstrap=None`` rebuilds.
+        """
         linkname = os.path.join(self._dir, "root.json")
-        version = self._trusted_set.root.version
+        if version is None:
+            version = self._trusted_set.root.version
         current = os.path.join("root_history", f"{version}.root.json")
         with contextlib.suppress(FileNotFoundError):
             os.remove(linkname)
@@ -384,17 +491,25 @@ class Updater:
             else:
                 raise
 
-    def _load_root(self) -> None:
-        """Load root metadata.
+    def _load_root(self, trusted_set: TrustedMetadataSet | None = None) -> None:
+        """Load root metadata into ``trusted_set``.
 
         Sequentially load newer root metadata versions. First try to load from
         local cache and if that does not work, from the remote repository.
 
         If metadata is loaded from remote repository, store it in local cache.
+        Every accepted root is persisted immediately (by version in
+        root_history), so authenticated root version advances survive both a
+        failed round and an instance rebuild.
+
+        When ``trusted_set`` is not given the serving view is used; refresh()
+        always passes its private candidate.
         """
+        if trusted_set is None:
+            trusted_set = self._trusted_set
 
         # Update the root role
-        lower_bound = self._trusted_set.root.version + 1
+        lower_bound = trusted_set.root.version + 1
         upper_bound = lower_bound + self.config.max_root_rotations
 
         try:
@@ -405,7 +520,7 @@ class Updater:
                         self._dir, "root_history", f"{next_version}.root.json"
                     )
                     with open(root_path, "rb") as f:
-                        self._trusted_set.update_root(f.read())
+                        trusted_set.update_root(f.read())
                     continue
                 except (OSError, exceptions.RepositoryError) as e:
                     # this root did not exist locally or is invalid
@@ -418,7 +533,12 @@ class Updater:
                         self.config.root_max_length,
                         next_version,
                     )
-                    self._trusted_set.update_root(data)
+                    # update_root() only accepts data that passed the previous
+                    # root's threshold signatures, the version check and the
+                    # new root's self-signature. A failure raises before the
+                    # root is added, so the bytes below are only persisted once
+                    # the version lower bound has actually advanced.
+                    trusted_set.update_root(data)
                     self._persist_root(next_version, data)
 
                 except exceptions.DownloadHTTPError as exception:
@@ -428,60 +548,155 @@ class Updater:
                     break
         finally:
             # Make sure the non-versioned root.json links to current version
-            self._update_root_symlink()
+            self._update_root_symlink(trusted_set.root.version)
 
-    def _load_timestamp(self) -> None:
-        """Load local and remote timestamp metadata."""
+    def _load_timestamp(
+        self, trusted_set: TrustedMetadataSet | None = None
+    ) -> None:
+        """Load local and remote timestamp metadata into ``trusted_set``."""
+        if trusted_set is None:
+            trusted_set = self._trusted_set
         try:
             data = self._load_local_metadata(Timestamp.type)
-            self._trusted_set.update_timestamp(data)
+            trusted_set.update_timestamp(data)
         except (OSError, exceptions.RepositoryError) as e:
             # Local timestamp does not exist or is invalid
             logger.debug("Local timestamp not valid as final: %s", e)
+
+        # Replay a rollback anchor from an earlier failed round. Like the
+        # regular local cache this is best-effort: an expired anchor is still
+        # added as an intermediate timestamp and therefore protects against
+        # rollback of both timestamp and snapshot versions.
+        self._load_timestamp_anchor(trusted_set)
 
         # Load from remote (whether local load succeeded or not)
         data = self._download_metadata(
             Timestamp.type, self.config.timestamp_max_length
         )
+        previous = trusted_set.get(Timestamp.type)
         try:
-            self._trusted_set.update_timestamp(data)
+            trusted_set.update_timestamp(data)
         except exceptions.EqualVersionNumberError:
             # If the new timestamp version is the same as current, discard the
             # new timestamp. This is normal and it shouldn't raise any error.
             return
+        except exceptions.RepositoryError:
+            # If update_timestamp() added the new timestamp before the final
+            # check failed (the only such case is an expired timestamp), the
+            # candidate now holds an authenticated intermediate rollback
+            # boundary. Persist it so the boundary survives a retry/rebuild;
+            # verification or rollback failures happen before _add() and must
+            # not be persisted.
+            if trusted_set.get(Timestamp.type) is not previous:
+                self._persist_anchor(Timestamp.type, data)
+            raise
 
         self._persist_metadata(Timestamp.type, data)
+        self._remove_anchor(Timestamp.type)
 
-    def _load_snapshot(self) -> None:
+    def _load_timestamp_anchor(self, trusted_set: TrustedMetadataSet) -> None:
+        """Best-effort replay of a persisted timestamp rollback anchor."""
+        try:
+            data = self._load_local_anchor(Timestamp.type)
+            if data is None:
+                return
+            trusted_set.update_timestamp(data)
+        except OSError as e:
+            logger.debug("Could not read timestamp rollback anchor: %s", e)
+        except exceptions.RepositoryError as e:
+            # Expired anchors are still loaded as intermediate metadata by
+            # TrustedMetadataSet; any other rejection just means the anchor is
+            # not usable under the current root and can be ignored here.
+            logger.debug("Timestamp rollback anchor not final: %s", e)
+
+    def _load_snapshot(
+        self, trusted_set: TrustedMetadataSet | None = None
+    ) -> None:
         """Load local (and if needed remote) snapshot metadata."""
+        if trusted_set is None:
+            trusted_set = self._trusted_set
         try:
             data = self._load_local_metadata(Snapshot.type)
-            self._trusted_set.update_snapshot(data, trusted=True)
-            logger.debug("Local snapshot is valid: not downloading new one")
+            trusted_set.update_snapshot(data, trusted=True)
+            logger.debug("Loaded local snapshot as trusted metadata")
         except (OSError, exceptions.RepositoryError) as e:
-            # Local snapshot does not exist or is invalid: update from remote
+            # Local snapshot does not exist or is invalid: the anchor replay
+            # and/or the remote download below will provide the rollback state
             logger.debug("Local snapshot not valid as final: %s", e)
 
-            snapshot_meta = self._trusted_set.timestamp.snapshot_meta
-            length = snapshot_meta.length or self.config.snapshot_max_length
-            version = None
-            if self._trusted_set.root.consistent_snapshot:
-                version = snapshot_meta.version
+        # Replay a possible rollback anchor from an earlier failed round. This
+        # is done even if the regular local snapshot loaded successfully: a
+        # higher authenticated anchor can turn that snapshot intermediate and
+        # must then force a remote update instead of being silently ignored.
+        self._load_snapshot_anchor(trusted_set)
 
-            data = self._download_metadata(Snapshot.type, length, version)
-            self._trusted_set.update_snapshot(data)
-            self._persist_metadata(Snapshot.type, data)
+        if trusted_set.is_final_snapshot():
+            logger.debug("Local snapshot is final: not downloading new one")
+            return
 
-    def _load_targets(self, role: str, parent_role: str) -> Targets:
-        """Load local (and if needed remote) metadata for ``role``."""
+        snapshot_meta = trusted_set.timestamp.snapshot_meta
+        length = snapshot_meta.length or self.config.snapshot_max_length
+        version = None
+        if trusted_set.root.consistent_snapshot:
+            version = snapshot_meta.version
 
-        # Avoid loading 'role' more than once for the same parent_role
-        if self._trusted_set.contains(role, parent_role):
-            return cast("Targets", self._trusted_set[role])
+        data = self._download_metadata(Snapshot.type, length, version)
+        previous = trusted_set.get(Snapshot.type)
+        try:
+            trusted_set.update_snapshot(data)
+        except exceptions.RepositoryError:
+            # As with timestamp: if the candidate's snapshot object changed,
+            # update_snapshot() accepted and added the new snapshot before a
+            # final check (expiry/version match) failed. Persist those bytes
+            # as a rollback anchor; failures before _add() changed nothing.
+            if trusted_set.get(Snapshot.type) is not previous:
+                self._persist_anchor(Snapshot.type, data)
+            raise
+
+        self._persist_metadata(Snapshot.type, data)
+        self._remove_anchor(Snapshot.type)
+
+    def _load_snapshot_anchor(self, trusted_set: TrustedMetadataSet) -> None:
+        """Best-effort replay of a persisted snapshot rollback anchor."""
+        try:
+            data = self._load_local_anchor(Snapshot.type)
+            if data is None:
+                return
+            # The anchor was fully verified when first accepted; load it as
+            # trusted local metadata, like the regular cached snapshot.
+            trusted_set.update_snapshot(data, trusted=True)
+        except OSError as e:
+            logger.debug("Could not read snapshot rollback anchor: %s", e)
+        except exceptions.RepositoryError as e:
+            # Intermediate anchors stay in the set for rollback protection;
+            # anything unusable under the current timestamp is simply ignored.
+            logger.debug("Snapshot rollback anchor not final: %s", e)
+
+    def _load_targets(
+        self,
+        role: str,
+        parent_role: str,
+        trusted_set: TrustedMetadataSet | None = None,
+    ) -> Targets:
+        """Load local (and if needed remote) metadata for ``role``.
+
+        When ``trusted_set`` is not given, the current serving view is used,
+        which is the target-lookup path. refresh() passes its candidate to
+        load the top-level targets of the view under construction.
+        """
+        if trusted_set is None:
+            trusted_set = self._trusted_set
+
+        # Avoid loading 'role' more than once into this view for the same
+        # parent_role. The cache is per TrustedMetadataSet/view: every
+        # successful refresh installs a fresh set, so metadata verified in an
+        # earlier round is never reused without re-verification.
+        if trusted_set.contains(role, parent_role):
+            return cast("Targets", trusted_set[role])
 
         try:
             data = self._load_local_metadata(role)
-            delegated_targets = self._trusted_set.update_delegated_targets(
+            delegated_targets = trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
             logger.debug("Local %s is valid: not downloading new one", role)
@@ -490,7 +705,7 @@ class Updater:
             # Local 'role' does not exist or is invalid: update from remote
             logger.debug("Failed to load local %s: %s", role, e)
 
-            snapshot = self._trusted_set.snapshot
+            snapshot = trusted_set.snapshot
             metainfo = snapshot.meta.get(f"{role}.json")
             if metainfo is None:
                 raise exceptions.RepositoryError(
@@ -499,11 +714,11 @@ class Updater:
 
             length = metainfo.length or self.config.targets_max_length
             version = None
-            if self._trusted_set.root.consistent_snapshot:
+            if trusted_set.root.consistent_snapshot:
                 version = metainfo.version
 
             data = self._download_metadata(role, length, version)
-            delegated_targets = self._trusted_set.update_delegated_targets(
+            delegated_targets = trusted_set.update_delegated_targets(
                 data, role, parent_role
             )
             self._persist_metadata(role, data)
@@ -539,6 +754,11 @@ class Updater:
 
             # The metadata for 'role_name' must be downloaded/updated before
             # its targets, delegations, and child roles can be inspected.
+            # Target lookup always operates on the current serving view: the
+            # last successfully refreshed TrustedMetadataSet. Its per-view
+            # cache avoids repeated loads within one view, while a successful
+            # refresh replaces the whole set and thereby invalidates entries
+            # verified under the previous snapshot/delegations.
             targets = self._load_targets(role_name, parent_role)
 
             target = targets.targets.get(target_filepath)
